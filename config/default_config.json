@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "budgets": {
+    "rare_earth_count_min": 1,
+    "rare_earth_count_max": 4,
+    "additional_element_count_min": 0,
+    "additional_element_to_re_max": 1.0,
+    "formula_unit_atom_max": 24,
+    "x_re_min": 0.5
+  },
+  "elements": {
+    "rare_earth_oxidation_states": {
+      "Ce": [3, 4],
+      "Tb": [3, 4]
+    },
+    "anion_oxidation_states": {
+      "O": -2,
+      "F": -1
+    },
+    "additional_element_pool": {
+      "Li": [1],
+      "Na": [1],
+      "K": [1],
+      "Rb": [1],
+      "Cs": [1],
+      "Mg": [2],
+      "Ca": [2],
+      "Sr": [2],
+      "Ba": [2],
+      "Zn": [2],
+      "Al": [3],
+      "Ga": [3],
+      "In": [3],
+      "Sc": [3],
+      "Y": [3],
+      "La": [3],
+      "Gd": [3],
+      "Lu": [3],
+      "Ti": [3, 4],
+      "Zr": [4],
+      "Hf": [4],
+      "Nb": [5],
+      "Ta": [5],
+      "Mn": [2, 3, 4],
+      "Fe": [2, 3],
+      "Cu": [1, 2],
+      "Sn": [2, 4]
+    }
+  },
+  "exclusions": {
+    "symbols": ["Tc", "Pm", "Be", "Cd", "Hg", "Tl", "As", "Pb"],
+    "atomic_number_at_least": 84
+  },
+  "output_directory": "../results/default_run"
+}

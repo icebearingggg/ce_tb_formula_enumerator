@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ce-tb-formula-enumerator"
+version = "0.1.0"
+description = "Deterministic formal-charge enumeration of Ce/Tb oxide, fluoride, and oxyfluoride compositions"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = {text = "MIT"}
+authors = [{name = "Ce/Tb search project"}]
+dependencies = [
+  "pymatgen>=2024.11.13,<2027",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<10",
+]
+
+[project.scripts]
+ce-tb-enumerate = "ce_tb_enumerator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

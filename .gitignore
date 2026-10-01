@@ -1,0 +1,50 @@
+# Python environments and bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Test, coverage, type-checker, and packaging artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Editors and operating-system metadata
+.idea/
+.vscode/
+.codex/
+.agents/
+.DS_Store
+Thumbs.db
+
+# Local settings, credentials, logs, and temporary files
+.env
+.env.*
+!.env.example
+.secrets/
+*.local
+*.log
+*.tmp
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials*.json
+secrets*.json
+config/local*.json
+config/*local*.json
+
+# Generated enumeration output (can be large and is reproducible)
+results/
+output/
+outputs/
