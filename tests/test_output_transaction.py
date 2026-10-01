@@ -49,6 +49,26 @@ def _fail_second_publication(monkeypatch, *, fail_compositions_restore: bool = F
     monkeypatch.setattr(output_module, "_replace_output", injected_replace)
 
 
+def _fail_recovery_cleanup_after_removing_one_backup(monkeypatch):
+    real_rmtree = output_module.shutil.rmtree
+
+    def injected_rmtree(path, *args, **kwargs):
+        path = Path(path)
+        if path.name == RECOVERY_DIRECTORY_NAME:
+            (path / "compositions.csv.backup").unlink(missing_ok=True)
+            raise OSError("injected recovery cleanup failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(output_module.shutil, "rmtree", injected_rmtree)
+
+
+def _core_bytes(output_dir: Path) -> tuple[bytes, bytes, bytes]:
+    return tuple(
+        (output_dir / name).read_bytes()
+        for name in ("compositions.csv", "charge_hypotheses.jsonl", "formulas.txt")
+    )
+
+
 def test_staging_failure_leaves_existing_outputs_unchanged(make_config, tmp_path, monkeypatch):
     output_dir = tmp_path / "outputs"
     _run(make_config(m_pool={"Fe": [2, 3]}), output_dir)
@@ -123,6 +143,71 @@ def test_rollback_failure_preserves_recovery_material_and_blocks_writes(
     manifest = json.loads((recovery_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "recovery_failed"
     assert manifest["recovery_errors"]
+
+    monkeypatch.undo()
+    with pytest.raises(OutputRecoveryError, match="unfinished output recovery state"):
+        _run(old_config, output_dir, overwrite=True)
+
+
+def test_published_cleanup_failure_keeps_complete_new_outputs_and_accurate_guidance(
+    make_config, tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "outputs"
+    reference_dir = tmp_path / "new-reference"
+    old_config = make_config(m_pool={"Fe": [2, 3]})
+    new_config = make_config(m_pool={"Ca": [2]})
+    _run(old_config, output_dir)
+    reference_summary = _run(new_config, reference_dir)
+    _fail_recovery_cleanup_after_removing_one_backup(monkeypatch)
+
+    with pytest.raises(OutputRecoveryError, match="all new outputs were published successfully"):
+        _run(new_config, output_dir, overwrite=True)
+
+    assert _core_bytes(output_dir) == _core_bytes(reference_dir)
+    summary = json.loads((output_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["results"] == reference_summary["results"]
+    assert summary["effective_config"]["elements"]["additional_element_pool"] == {"Ca": [2]}
+
+    recovery_dir = output_dir / RECOVERY_DIRECTORY_NAME
+    manifest = json.loads((recovery_dir / "manifest.json").read_text(encoding="utf-8"))
+    report = (recovery_dir / "RECOVERY_REQUIRED.txt").read_text(encoding="utf-8")
+    assert manifest["status"] == "published_cleanup_failed"
+    assert "cleanup_error" in manifest
+    assert not (recovery_dir / "compositions.csv.backup").exists()
+    assert (recovery_dir / "charge_hypotheses.jsonl.backup").is_file()
+    assert "All new outputs were published successfully" in report
+    assert "Do not restore old backups" in report
+    assert "rollback was incomplete" not in report
+
+    monkeypatch.undo()
+    with pytest.raises(OutputRecoveryError, match="unfinished output recovery state"):
+        _run(new_config, output_dir, overwrite=True)
+
+
+def test_rolled_back_cleanup_failure_reports_restored_originals(
+    make_config, tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "outputs"
+    old_config = make_config(m_pool={"Fe": [2, 3]})
+    new_config = make_config(m_pool={"Ca": [2]})
+    _run(old_config, output_dir)
+    before = _snapshot(output_dir)
+    _fail_second_publication(monkeypatch)
+    _fail_recovery_cleanup_after_removing_one_backup(monkeypatch)
+
+    with pytest.raises(OutputRecoveryError, match="original outputs were restored successfully"):
+        _run(new_config, output_dir, overwrite=True)
+
+    assert _snapshot(output_dir) == before
+    recovery_dir = output_dir / RECOVERY_DIRECTORY_NAME
+    manifest = json.loads((recovery_dir / "manifest.json").read_text(encoding="utf-8"))
+    report = (recovery_dir / "RECOVERY_REQUIRED.txt").read_text(encoding="utf-8")
+    assert manifest["status"] == "rolled_back_cleanup_failed"
+    assert "publish_error" in manifest
+    assert "cleanup_error" in manifest
+    assert "automatic rollback completed" in report
+    assert "Do not restore them again" in report
+    assert "rollback was incomplete" not in report
 
     monkeypatch.undo()
     with pytest.raises(OutputRecoveryError, match="unfinished output recovery state"):

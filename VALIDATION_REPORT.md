@@ -82,3 +82,20 @@ Windows 已完成环境、测试、默认运行、覆盖保护及可复现性验
 结果：`MATCH: 34648 composition keys and normalized charge hypotheses`。
 
 本次实际验证平台仅为 Windows。没有运行 Linux，因此不声称本次修改已在 Linux 实测；测试和实现避免硬编码本机路径，并使用 Python 标准库的跨平台文件 API，为后续 Linux 验收保留相同命令和故障注入测试。事务保证限于可捕获运行错误下的回滚；发布仍是逐文件替换，不是四文件瞬时原子切换，也不完全覆盖断电、操作系统崩溃或强制终止。
+
+## 2026-10-01 发布后清理状态修补验证
+
+本次继续使用项目既有 `.venv`，未安装或升级依赖。实际环境为 Windows、CPython 3.11.9、pip 24.0、pymatgen 2026.9.24、pytest 9.1.1；`python -m pip check` 报告 `No broken requirements found.`
+
+恢复记录现区分四种状态：真正回滚未完成的 `recovery_failed`、原始输出已恢复而仅清理失败的 `rolled_back_cleanup_failed`、新输出已完整发布而仅清理失败的 `published_cleanup_failed`，以及正式输出未改变而发布前材料清理失败的 `prepublish_cleanup_failed`。`manifest.json`、`RECOVERY_REQUIRED.txt` 和抛出的错误信息使用一致语义；后三种状态不会再指示用户执行不必要或有风险的旧备份恢复。
+
+新增两个故障注入测试，均使用临时目录和 monkeypatch：
+
+- 四个不同配置的新输出全部发布后，模拟先删除一个旧备份、再令恢复目录清理抛出 `OSError`。验证正式四件套仍完整属于新运行，状态为 `published_cleanup_failed`，说明明确要求保留新结果且禁止恢复可能不完整的旧备份，剩余恢复材料保留，后续覆盖被阻止。
+- 发布中途失败且自动回滚成功后，模拟相同的部分清理错误。验证原始四件套已完整恢复，状态为 `rolled_back_cleanup_failed`，说明明确要求保留已恢复结果且不要再次恢复，剩余材料保留，后续覆盖被阻止。
+
+完整测试结果为 `28 passed in 4.77s`。原有发布失败回滚、回滚失败保护、空 M 池、科学验收、小空间直接穷举、约化、混合价态、中文与空格路径测试全部继续通过。
+
+未修改默认配置，并将默认枚举写入新目录 `results/default_run_cleanup_state_fix_20261001`，未覆盖已有结果。统计仍为 34,648 个唯一组成和 37,946 条可行电荷假设；成功后没有暂存或恢复目录残留。与上一版 `results/default_run_transaction_fix_20261001` 进行集合级比较，结果为：`MATCH: 34648 composition keys and normalized charge hypotheses`。
+
+本次仅在 Windows 实际运行验证，没有 Linux 实测，因此不声称 Linux 已通过。实现继续使用 Python 标准库跨平台文件 API，测试不依赖真实磁盘耗尽或权限修改。清理仍是逐项文件系统操作，不具有多文件原子性；报告写入采用尽力而为，失败时不会主动删除剩余恢复材料或掩盖原始错误。

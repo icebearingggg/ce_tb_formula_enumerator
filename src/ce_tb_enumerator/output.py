@@ -80,8 +80,8 @@ def _preflight(output_dir: Path, overwrite: bool) -> dict[str, bool]:
     recovery_dir = output_dir / RECOVERY_DIRECTORY_NAME
     if _path_present(recovery_dir):
         raise OutputRecoveryError(
-            "unfinished output recovery state exists; inspect and recover it before another "
-            f"write: {recovery_dir}"
+            "unfinished output recovery state exists; inspect its manifest and resolve it "
+            f"before another write: {recovery_dir}"
         )
 
     original_state: dict[str, bool] = {}
@@ -123,26 +123,34 @@ def _restore_from_backup(backup: Path, target: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _record_recovery_failure(
+def _record_recovery_state(
     recovery_dir: Path,
     manifest: dict[str, Any],
-    publish_error: BaseException,
-    recovery_errors: list[str],
+    *,
+    status: str,
+    summary: str,
+    details: dict[str, Any],
+    instructions: str,
 ) -> None:
-    manifest["status"] = "recovery_failed"
-    manifest["publish_error"] = f"{type(publish_error).__name__}: {publish_error}"
-    manifest["recovery_errors"] = recovery_errors
+    manifest["status"] = status
+    manifest.update(details)
     try:
         _write_manifest(recovery_dir, manifest)
     except OSError:
         pass
     report = recovery_dir / "RECOVERY_REQUIRED.txt"
     try:
+        detail_lines = [
+            f"{key}: {json.dumps(value, ensure_ascii=False)}"
+            for key, value in details.items()
+        ]
         report.write_text(
-            "Automatic output rollback was incomplete. Preserve this directory and inspect "
-            f"{RECOVERY_MANIFEST_NAME} plus the *.backup files before writing again.\n"
-            f"Publication error: {type(publish_error).__name__}: {publish_error}\n"
-            + "\n".join(recovery_errors)
+            f"Status: {status}\n"
+            f"{summary}\n"
+            "Preserve this directory and inspect "
+            f"{RECOVERY_MANIFEST_NAME} plus the remaining files before writing again.\n"
+            f"Action: {instructions}\n"
+            + "\n".join(detail_lines)
             + "\n",
             encoding="utf-8",
         )
@@ -214,15 +222,27 @@ def _publish_staged_outputs(
         try:
             shutil.rmtree(recovery_dir)
         except OSError as cleanup_exc:
-            _record_recovery_failure(
+            cleanup_error = f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+            _record_recovery_state(
                 recovery_dir,
                 manifest,
-                exc,
-                [f"backup cleanup: {type(cleanup_exc).__name__}: {cleanup_exc}"],
+                status="prepublish_cleanup_failed",
+                summary=(
+                    "New outputs were not published and the named outputs were not changed; "
+                    "only cleanup of recovery material failed."
+                ),
+                details={
+                    "backup_preparation_error": f"{type(exc).__name__}: {exc}",
+                    "cleanup_error": cleanup_error,
+                },
+                instructions=(
+                    "Keep the current named outputs. Do not restore from partial backups; "
+                    "after verification, remove only the leftover recovery material."
+                ),
             )
             raise OutputRecoveryError(
-                "could not prepare output backups and cleanup was incomplete; preserve and "
-                f"inspect recovery material at {recovery_dir}"
+                "new outputs were not published and named outputs remain unchanged, but "
+                f"recovery-material cleanup failed; inspect {recovery_dir}"
             ) from exc
         raise OutputTransactionError(
             f"could not prepare output backups; named outputs were not changed: {exc}"
@@ -234,7 +254,20 @@ def _publish_staged_outputs(
     except OSError as exc:
         recovery_errors = _rollback_outputs(output_dir, recovery_dir, original_state)
         if recovery_errors:
-            _record_recovery_failure(recovery_dir, manifest, exc, recovery_errors)
+            _record_recovery_state(
+                recovery_dir,
+                manifest,
+                status="recovery_failed",
+                summary="Automatic output rollback was incomplete.",
+                details={
+                    "publish_error": f"{type(exc).__name__}: {exc}",
+                    "recovery_errors": recovery_errors,
+                },
+                instructions=(
+                    "Inspect the original-existence map and remaining *.backup files, then "
+                    "restore the original output state before removing recovery material."
+                ),
+            )
             raise OutputRecoveryError(
                 "output publication failed and automatic rollback was incomplete; preserve "
                 f"and inspect recovery material at {recovery_dir}"
@@ -242,15 +275,26 @@ def _publish_staged_outputs(
         try:
             shutil.rmtree(recovery_dir)
         except OSError as cleanup_exc:
-            _record_recovery_failure(
+            _record_recovery_state(
                 recovery_dir,
                 manifest,
-                exc,
-                [f"post-rollback cleanup: {type(cleanup_exc).__name__}: {cleanup_exc}"],
+                status="rolled_back_cleanup_failed",
+                summary=(
+                    "Publication failed, but automatic rollback completed and the original "
+                    "outputs were restored; only cleanup of recovery material failed."
+                ),
+                details={
+                    "publish_error": f"{type(exc).__name__}: {exc}",
+                    "cleanup_error": f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                },
+                instructions=(
+                    "Keep and verify the restored original outputs. Do not restore them again "
+                    "from backups; after verification, remove only the leftover recovery material."
+                ),
             )
             raise OutputRecoveryError(
-                "outputs were restored after publication failed, but recovery material could "
-                f"not be cleaned; inspect {recovery_dir}"
+                "publication failed and original outputs were restored successfully; only "
+                f"recovery-material cleanup failed, so do not restore again; inspect {recovery_dir}"
             ) from exc
         raise OutputTransactionError(
             f"output publication failed; all named outputs were restored: {exc}"
@@ -261,14 +305,24 @@ def _publish_staged_outputs(
         _write_manifest(recovery_dir, manifest)
         shutil.rmtree(recovery_dir)
     except OSError as exc:
-        _record_recovery_failure(
+        _record_recovery_state(
             recovery_dir,
             manifest,
-            exc,
-            [f"post-publication cleanup: {type(exc).__name__}: {exc}"],
+            status="published_cleanup_failed",
+            summary=(
+                "All new outputs were published successfully; failure occurred only while "
+                "cleaning obsolete recovery material."
+            ),
+            details={"cleanup_error": f"{type(exc).__name__}: {exc}"},
+            instructions=(
+                "Keep and verify the complete new outputs in the formal output directory. "
+                "Do not restore old backups; after verification, remove only the leftover "
+                "recovery material."
+            ),
         )
         raise OutputRecoveryError(
-            "all outputs were published, but recovery material could not be cleaned; inspect "
+            "all new outputs were published successfully; only recovery-material cleanup "
+            f"failed, so keep the new outputs and do not restore old backups; inspect "
             f"{recovery_dir} before another overwrite"
         ) from exc
 
