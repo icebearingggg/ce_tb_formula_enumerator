@@ -150,8 +150,8 @@ def load_settings(config_path: Path, output_override: Path | None = None) -> Set
     z_limit = _positive_int(exclusions["atomic_number_at_least"], "exclusions.atomic_number_at_least")
 
     pool_raw = elements["additional_element_pool"]
-    if not isinstance(pool_raw, dict) or not pool_raw:
-        raise ConfigurationError("elements.additional_element_pool must be a non-empty object")
+    if not isinstance(pool_raw, dict):
+        raise ConfigurationError("elements.additional_element_pool must be a JSON object")
     forbidden_m = {"Ce", "Tb", "O", "F"}
     excluded_set = {item.symbol for item in excluded_elements}
     m_pool: dict[str, tuple[int, ...]] = {}

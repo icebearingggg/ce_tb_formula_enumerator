@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import load_settings
 from .enumerator import enumerate_compositions
-from .errors import ConfigurationError, OutputExistsError
+from .errors import ConfigurationError
 from .output import write_outputs
 
 
@@ -49,8 +49,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         summary = run(args)
-    except (ConfigurationError, OutputExistsError) as exc:
+    except ConfigurationError as exc:
         parser.exit(2, f"error: {exc}\n")
+    except OSError as exc:
+        parser.exit(2, f"error: output filesystem operation failed: {exc}\n")
     results = summary["results"]
     print(json.dumps(results, ensure_ascii=False, sort_keys=True))
     return 0

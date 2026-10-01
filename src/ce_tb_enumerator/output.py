@@ -6,9 +6,9 @@ import csv
 import json
 import os
 import platform
+import shutil
 import sys
 import tempfile
-import time
 from collections import Counter
 from datetime import datetime, timezone
 from fractions import Fraction
@@ -18,7 +18,7 @@ from typing import Any, Callable, TextIO
 
 from . import __version__
 from .config import Settings
-from .errors import OutputExistsError
+from .errors import OutputExistsError, OutputRecoveryError, OutputTransactionError
 from .model import CompositionRecord
 
 
@@ -28,6 +28,9 @@ OUTPUT_NAMES = (
     "formulas.txt",
     "run_summary.json",
 )
+RECOVERY_DIRECTORY_NAME = ".ce-tb-output-recovery"
+STAGING_DIRECTORY_PREFIX = ".ce-tb-output-stage-"
+RECOVERY_MANIFEST_NAME = "manifest.json"
 
 
 def _number(value: Fraction) -> str:
@@ -41,28 +44,233 @@ def _fraction_payload(value: Fraction) -> dict[str, Any]:
     }
 
 
-def _atomic_text_write(path: Path, writer: Callable[[TextIO], None], newline: str | None = None) -> None:
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as handle:
-            writer(handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
+def _path_present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
 
 
-def _preflight(output_dir: Path, overwrite: bool) -> None:
+def _write_text_file(
+    path: Path, writer: Callable[[TextIO], None], newline: str | None = None
+) -> None:
+    with path.open("x", encoding="utf-8", newline=newline) as handle:
+        writer(handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _write_manifest(recovery_dir: Path, manifest: dict[str, Any]) -> None:
+    temporary = recovery_dir / f".{RECOVERY_MANIFEST_NAME}.tmp"
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, recovery_dir / RECOVERY_MANIFEST_NAME)
+
+
+def _replace_output(source: Path, target: Path) -> None:
+    """Replace one named output; kept separate for deterministic fault injection."""
+    os.replace(source, target)
+
+
+def _preflight(output_dir: Path, overwrite: bool) -> dict[str, bool]:
     if output_dir.exists() and not output_dir.is_dir():
         raise OutputExistsError(f"output path exists and is not a directory: {output_dir}")
-    existing = [output_dir / name for name in OUTPUT_NAMES if (output_dir / name).exists()]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    recovery_dir = output_dir / RECOVERY_DIRECTORY_NAME
+    if _path_present(recovery_dir):
+        raise OutputRecoveryError(
+            "unfinished output recovery state exists; inspect and recover it before another "
+            f"write: {recovery_dir}"
+        )
+
+    original_state: dict[str, bool] = {}
+    existing: list[Path] = []
+    for name in OUTPUT_NAMES:
+        target = output_dir / name
+        present = _path_present(target)
+        original_state[name] = present
+        if present:
+            if target.is_symlink() or not target.is_file():
+                raise OutputTransactionError(
+                    f"output target exists but is not a regular file: {target}"
+                )
+            existing.append(target)
     if existing and not overwrite:
         joined = ", ".join(str(path) for path in existing)
         raise OutputExistsError(f"refusing to overwrite existing output file(s): {joined}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    return original_state
+
+
+def _copy_backup(source: Path, destination: Path) -> None:
+    shutil.copy2(source, destination)
+    with destination.open("rb+") as handle:
+        os.fsync(handle.fileno())
+
+
+def _restore_from_backup(backup: Path, target: Path) -> None:
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.restore-", suffix=".tmp", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    os.close(fd)
+    try:
+        shutil.copy2(backup, temporary)
+        with temporary.open("rb+") as handle:
+            os.fsync(handle.fileno())
+        _replace_output(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _record_recovery_failure(
+    recovery_dir: Path,
+    manifest: dict[str, Any],
+    publish_error: BaseException,
+    recovery_errors: list[str],
+) -> None:
+    manifest["status"] = "recovery_failed"
+    manifest["publish_error"] = f"{type(publish_error).__name__}: {publish_error}"
+    manifest["recovery_errors"] = recovery_errors
+    try:
+        _write_manifest(recovery_dir, manifest)
+    except OSError:
+        pass
+    report = recovery_dir / "RECOVERY_REQUIRED.txt"
+    try:
+        report.write_text(
+            "Automatic output rollback was incomplete. Preserve this directory and inspect "
+            f"{RECOVERY_MANIFEST_NAME} plus the *.backup files before writing again.\n"
+            f"Publication error: {type(publish_error).__name__}: {publish_error}\n"
+            + "\n".join(recovery_errors)
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _rollback_outputs(
+    output_dir: Path,
+    recovery_dir: Path,
+    original_state: dict[str, bool],
+) -> list[str]:
+    errors: list[str] = []
+    for name in OUTPUT_NAMES:
+        target = output_dir / name
+        try:
+            if original_state[name]:
+                _restore_from_backup(recovery_dir / f"{name}.backup", target)
+            elif _path_present(target):
+                if target.is_dir() and not target.is_symlink():
+                    raise IsADirectoryError(f"cannot remove unexpected directory {target}")
+                target.unlink()
+        except OSError as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    return errors
+
+
+def _publish_staged_outputs(
+    output_dir: Path,
+    staging_dir: Path,
+    original_state: dict[str, bool],
+) -> None:
+    current_state = {name: _path_present(output_dir / name) for name in OUTPUT_NAMES}
+    if current_state != original_state:
+        raise OutputTransactionError(
+            "named output files changed while new results were being prepared; refusing to publish"
+        )
+
+    recovery_dir = output_dir / RECOVERY_DIRECTORY_NAME
+    try:
+        recovery_dir.mkdir()
+    except FileExistsError as exc:
+        raise OutputRecoveryError(
+            "another writer or unfinished recovery state is present; inspect: "
+            f"{recovery_dir}"
+        ) from exc
+
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "preparing_backups",
+        "output_directory": str(output_dir),
+        "staging_directory": str(staging_dir),
+        "outputs": {
+            name: {
+                "originally_existed": original_state[name],
+                "backup": f"{name}.backup" if original_state[name] else None,
+            }
+            for name in OUTPUT_NAMES
+        },
+    }
+    try:
+        _write_manifest(recovery_dir, manifest)
+        for name in OUTPUT_NAMES:
+            if original_state[name]:
+                _copy_backup(output_dir / name, recovery_dir / f"{name}.backup")
+        manifest["status"] = "publishing"
+        _write_manifest(recovery_dir, manifest)
+    except OSError as exc:
+        try:
+            shutil.rmtree(recovery_dir)
+        except OSError as cleanup_exc:
+            _record_recovery_failure(
+                recovery_dir,
+                manifest,
+                exc,
+                [f"backup cleanup: {type(cleanup_exc).__name__}: {cleanup_exc}"],
+            )
+            raise OutputRecoveryError(
+                "could not prepare output backups and cleanup was incomplete; preserve and "
+                f"inspect recovery material at {recovery_dir}"
+            ) from exc
+        raise OutputTransactionError(
+            f"could not prepare output backups; named outputs were not changed: {exc}"
+        ) from exc
+
+    try:
+        for name in OUTPUT_NAMES:
+            _replace_output(staging_dir / name, output_dir / name)
+    except OSError as exc:
+        recovery_errors = _rollback_outputs(output_dir, recovery_dir, original_state)
+        if recovery_errors:
+            _record_recovery_failure(recovery_dir, manifest, exc, recovery_errors)
+            raise OutputRecoveryError(
+                "output publication failed and automatic rollback was incomplete; preserve "
+                f"and inspect recovery material at {recovery_dir}"
+            ) from exc
+        try:
+            shutil.rmtree(recovery_dir)
+        except OSError as cleanup_exc:
+            _record_recovery_failure(
+                recovery_dir,
+                manifest,
+                exc,
+                [f"post-rollback cleanup: {type(cleanup_exc).__name__}: {cleanup_exc}"],
+            )
+            raise OutputRecoveryError(
+                "outputs were restored after publication failed, but recovery material could "
+                f"not be cleaned; inspect {recovery_dir}"
+            ) from exc
+        raise OutputTransactionError(
+            f"output publication failed; all named outputs were restored: {exc}"
+        ) from exc
+
+    manifest["status"] = "published"
+    try:
+        _write_manifest(recovery_dir, manifest)
+        shutil.rmtree(recovery_dir)
+    except OSError as exc:
+        _record_recovery_failure(
+            recovery_dir,
+            manifest,
+            exc,
+            [f"post-publication cleanup: {type(exc).__name__}: {exc}"],
+        )
+        raise OutputRecoveryError(
+            "all outputs were published, but recovery material could not be cleaned; inspect "
+            f"{recovery_dir} before another overwrite"
+        ) from exc
 
 
 def write_outputs(
@@ -74,7 +282,7 @@ def write_outputs(
     elapsed_seconds: float,
 ) -> dict[str, Any]:
     output_dir = settings.output_directory
-    _preflight(output_dir, overwrite)
+    original_state = _preflight(output_dir, overwrite)
 
     csv_fields = [
         "composition_id", "formula", "composition_key", "a", "b", "c", "m", "n", "M",
@@ -166,9 +374,24 @@ def write_outputs(
         json.dump(summary, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
 
-    # Preflight occurs before every write; each individual file is replaced atomically.
-    _atomic_text_write(output_dir / "compositions.csv", write_csv, newline="")
-    _atomic_text_write(output_dir / "charge_hypotheses.jsonl", write_hypotheses, newline="\n")
-    _atomic_text_write(output_dir / "formulas.txt", write_formulas, newline="\n")
-    _atomic_text_write(output_dir / "run_summary.json", write_summary, newline="\n")
+    staging_dir = Path(tempfile.mkdtemp(prefix=STAGING_DIRECTORY_PREFIX, dir=output_dir))
+    recovery_dir = output_dir / RECOVERY_DIRECTORY_NAME
+    try:
+        _write_text_file(staging_dir / "compositions.csv", write_csv, newline="")
+        _write_text_file(
+            staging_dir / "charge_hypotheses.jsonl", write_hypotheses, newline="\n"
+        )
+        _write_text_file(staging_dir / "formulas.txt", write_formulas, newline="\n")
+        _write_text_file(staging_dir / "run_summary.json", write_summary, newline="\n")
+        _publish_staged_outputs(output_dir, staging_dir, original_state)
+    except BaseException:
+        if not _path_present(recovery_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    try:
+        shutil.rmtree(staging_dir)
+    except OSError as exc:
+        raise OutputTransactionError(
+            f"outputs were published but temporary staging cleanup failed at {staging_dir}: {exc}"
+        ) from exc
     return summary
